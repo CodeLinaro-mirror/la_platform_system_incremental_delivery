@@ -46,6 +46,7 @@ cc_library_headers {
 
 cc_test {
     name: "libincfs-test",
+    defaults: ["libincfs_defaults"],
     cflags: ["-Werror", "-Wall", "-Wextra"],
     static_libs: [
         "libincfs",
@@ -55,6 +56,7 @@ cc_test {
     ],
     srcs: [
         "tests/incfs_test.cpp",
+        "tests/MountRegistry_test.cpp",
     ],
     require_root: true,
 }
