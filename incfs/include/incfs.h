@@ -27,6 +27,8 @@
 
 namespace android::incfs {
 
+using ByteBuffer = std::vector<char>;
+
 enum MountFlags {
     createOnly = INCFS_MOUNT_CREATE_ONLY,
     truncate = INCFS_MOUNT_TRUNCATE,
@@ -52,44 +54,26 @@ enum class BlockKind {
     hash = INCFS_BLOCK_KIND_HASH,
 };
 
-using Control = IncFsControl;
-
-struct UniqueControl final : Control {
-    UniqueControl(Control c) : Control(c) {}
-    UniqueControl() : UniqueControl({-1, -1, -1}) {}
-
-    ~UniqueControl() { reset(); }
-
+class UniqueControl {
+public:
+    UniqueControl() : mControl(nullptr) {}
+    UniqueControl(IncFsControl* control) : mControl(control) {}
+    ~UniqueControl();
+    IncFsFd cmd() const;
+    IncFsFd pendingReads() const;
+    IncFsFd logs() const;
+    operator IncFsControl*() const { return mControl; };
     UniqueControl(UniqueControl&& other) noexcept {
-        cmd = std::exchange(other.cmd, -1);
-        logs = std::exchange(other.logs, -1);
-        pendingReads = std::exchange(other.pendingReads, -1);
+        mControl = std::exchange(other.mControl, nullptr);
     }
-
     UniqueControl& operator=(UniqueControl&& other) {
         this->~UniqueControl();
         new (this) UniqueControl(std::move(other));
         return *this;
     }
 
-    [[nodiscard]] Control release() {
-        Control res = *this;
-        cmd = logs = pendingReads = -1;
-        return res;
-    }
-
-    void reset() {
-        if (cmd >= 0) {
-            close(cmd);
-        }
-        if (logs >= 0) {
-            close(logs);
-        }
-        if (pendingReads >= 0) {
-            close(pendingReads);
-        }
-        cmd = logs = pendingReads = -1;
-    }
+private:
+    IncFsControl* mControl;
 };
 
 // A mini version of std::span
@@ -102,6 +86,8 @@ public:
     constexpr Span(T* array, size_t length) : ptr_(array), len_(length) {}
     template <typename V>
     constexpr Span(const std::vector<V>& x) : Span(x.data(), x.size()) {}
+    template <typename V, size_t Size>
+    constexpr Span(V (&x)[Size]) : Span(x, Size) {}
 
     constexpr T* data() const { return ptr_; }
     constexpr size_t size() const { return len_; }
@@ -116,14 +102,51 @@ private:
     size_t len_;
 };
 
+struct BlockRange final : public IncFsBlockRange {
+    constexpr size_t size() const { return end - begin; }
+    constexpr bool empty() const { return end == begin; }
+};
+
+class FilledRanges final {
+public:
+    using RangeBuffer = std::vector<BlockRange>;
+
+    FilledRanges() = default;
+    FilledRanges(RangeBuffer&& buffer, IncFsFilledRanges ranges)
+          : buffer_(std::move(buffer)), rawFilledRanges_(ranges) {}
+
+    constexpr Span<BlockRange> dataRanges() const {
+        return {(BlockRange*)rawFilledRanges_.dataRanges, (size_t)rawFilledRanges_.dataRangesCount};
+    }
+    constexpr Span<BlockRange> hashRanges() const {
+        return {(BlockRange*)rawFilledRanges_.hashRanges, (size_t)rawFilledRanges_.hashRangesCount};
+    }
+
+    constexpr size_t totalSize() const { return dataRanges().size() + hashRanges().size(); }
+
+    RangeBuffer extractInternalBufferAndClear() {
+        rawFilledRanges_ = {};
+        return std::move(buffer_);
+    }
+
+    constexpr const RangeBuffer& internalBuffer() const { return buffer_; }
+    constexpr IncFsFilledRanges internalRawRanges() const { return rawFilledRanges_; }
+
+private:
+    RangeBuffer buffer_;
+    IncFsFilledRanges rawFilledRanges_;
+};
+
+using Control = UniqueControl;
+
 using FileId = IncFsFileId;
 using Size = IncFsSize;
 using BlockIndex = IncFsBlockIndex;
 using ErrorCode = IncFsErrorCode;
 using Fd = IncFsFd;
 using ReadInfo = IncFsReadInfo;
-using RawMetadata = std::vector<char>;
-using RawSignature = std::vector<char>;
+using RawMetadata = ByteBuffer;
+using RawSignature = ByteBuffer;
 using MountOptions = IncFsMountOptions;
 using DataBlock = IncFsDataBlock;
 using NewFileParams = IncFsNewFileParams;
@@ -139,41 +162,52 @@ std::string toString(FileId fileId);
 IncFsFileId toFileId(std::string_view str);
 bool isIncFsPath(std::string_view path);
 
-UniqueControl mount(std::string_view backingPath, std::string_view targetDir, MountOptions options);
+UniqueControl mount(std::string_view backingPath, std::string_view targetDir,
+                    IncFsMountOptions options);
 UniqueControl open(std::string_view dir);
-ErrorCode setOptions(Control control, MountOptions newOptions);
+UniqueControl createControl(IncFsFd cmd, IncFsFd pendingReads, IncFsFd logs);
+
+ErrorCode setOptions(const Control& control, MountOptions newOptions);
 
 ErrorCode bindMount(std::string_view sourceDir, std::string_view targetDir);
 ErrorCode unmount(std::string_view dir);
 
-std::string root(Control control);
+std::string root(const Control& control);
 
-ErrorCode makeFile(Control control, std::string_view path, int mode, FileId fileId,
+ErrorCode makeFile(const Control& control, std::string_view path, int mode, FileId fileId,
                    NewFileParams params);
-ErrorCode makeDir(Control control, std::string_view path, int mode = 0555);
+ErrorCode makeDir(const Control& control, std::string_view path, int mode = 0555);
 
-RawMetadata getMetadata(Control control, FileId fileId);
-RawMetadata getMetadata(Control control, std::string_view path);
-FileId getFileId(Control control, std::string_view path);
+RawMetadata getMetadata(const Control& control, FileId fileId);
+RawMetadata getMetadata(const Control& control, std::string_view path);
+FileId getFileId(const Control& control, std::string_view path);
 
-RawSignature getSignature(Control control, FileId fileId);
-RawSignature getSignature(Control control, std::string_view path);
+RawSignature getSignature(const Control& control, FileId fileId);
+RawSignature getSignature(const Control& control, std::string_view path);
 
-ErrorCode link(Control control, std::string_view sourcePath, std::string_view targetPath);
-ErrorCode unlink(Control control, std::string_view path);
+ErrorCode link(const Control& control, std::string_view sourcePath, std::string_view targetPath);
+ErrorCode unlink(const Control& control, std::string_view path);
 
 enum class WaitResult { HaveData, Timeout, Error };
 
-WaitResult waitForPendingReads(Control control, std::chrono::milliseconds timeout,
+WaitResult waitForPendingReads(const Control& control, std::chrono::milliseconds timeout,
                                std::vector<ReadInfo>* pendingReadsBuffer);
-WaitResult waitForPageReads(Control control, std::chrono::milliseconds timeout,
+WaitResult waitForPageReads(const Control& control, std::chrono::milliseconds timeout,
                             std::vector<ReadInfo>* pageReadsBuffer);
 
 // Returns a file descriptor that needs to be closed.
-int openWrite(Control control, FileId fileId);
+int openWrite(const Control& control, FileId fileId);
 // Returns a file descriptor that needs to be closed.
-int openWrite(Control control, std::string_view path);
+int openWrite(const Control& control, std::string_view path);
 ErrorCode writeBlocks(Span<const DataBlock> blocks);
+
+std::pair<ErrorCode, FilledRanges> getFilledRanges(int fd);
+std::pair<ErrorCode, FilledRanges> getFilledRanges(int fd, FilledRanges::RangeBuffer&& buffer);
+std::pair<ErrorCode, FilledRanges> getFilledRanges(int fd, FilledRanges&& resumeFrom);
+
+enum class LoadingState { Full, MissingBlocks };
+
+LoadingState isFullyLoaded(int fd);
 
 } // namespace android::incfs
 
