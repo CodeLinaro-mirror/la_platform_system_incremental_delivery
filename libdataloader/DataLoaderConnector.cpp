@@ -59,6 +59,7 @@ struct JniIds {
     jmethodID parcelFileDescriptorGetFileDescriptor;
 
     jfieldID incremental;
+    jfieldID service;
     jfieldID callback;
 
     jfieldID controlCmd;
@@ -83,7 +84,7 @@ struct JniIds {
     jfieldID installationFileLengthBytes;
     jfieldID installationFileMetadata;
 
-    jmethodID dataLoaderServiceSetStorageParams;
+    jmethodID incrementalServiceConnectorSetStorageParams;
 
     JniIds(JNIEnv* env) {
         listener = (jclass)env->NewGlobalRef(
@@ -141,6 +142,8 @@ struct JniIds {
         incremental =
                 GetFieldIDOrDie(env, control, "incremental",
                                 "Landroid/os/incremental/IncrementalFileSystemControlParcel;");
+        service = GetFieldIDOrDie(env, control, "service",
+                                  "Landroid/os/incremental/IIncrementalServiceConnector;");
         callback =
                 GetFieldIDOrDie(env, control, "callback",
                                 "Landroid/content/pm/IPackageInstallerSessionFileSystemConnector;");
@@ -177,12 +180,20 @@ struct JniIds {
         installationFileLengthBytes = GetFieldIDOrDie(env, installationFileParcel, "size", "J");
         installationFileMetadata = GetFieldIDOrDie(env, installationFileParcel, "metadata", "[B");
 
-        auto dataLoaderService =
-                FindClassOrDie(env, "android/service/dataloader/DataLoaderService");
-        dataLoaderServiceSetStorageParams =
-                GetMethodIDOrDie(env, dataLoaderService, "setStorageParams", "(IZ)Z");
+        auto incrementalServiceConnector =
+                FindClassOrDie(env, "android/os/incremental/IIncrementalServiceConnector");
+        incrementalServiceConnectorSetStorageParams =
+                GetMethodIDOrDie(env, incrementalServiceConnector, "setStorageParams", "(Z)I");
     }
 };
+
+JavaVM* getJavaVM(JNIEnv* env) {
+    CHECK(env);
+    JavaVM* jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    CHECK(jvm);
+    return jvm;
+}
 
 const JniIds& jniIds(JNIEnv* env) {
     static const JniIds ids(env);
@@ -272,13 +283,14 @@ static constexpr auto kPendingReadsBufferSize = 256;
 class DataLoaderConnector : public FilesystemConnector, public StatusListener {
 public:
     DataLoaderConnector(JNIEnv* env, jobject service, jint storageId, UniqueControl control,
-                        jobject callbackControl, jobject listener)
-          : mService(env->NewGlobalRef(service)),
+                        jobject serviceConnector, jobject callbackControl, jobject listener)
+          : mJvm(getJavaVM(env)),
+            mService(env->NewGlobalRef(service)),
+            mServiceConnector(env->NewGlobalRef(serviceConnector)),
             mCallbackControl(env->NewGlobalRef(callbackControl)),
             mListener(env->NewGlobalRef(listener)),
             mStorageId(storageId),
             mControl(std::move(control)) {
-        env->GetJavaVM(&mJvm);
         CHECK(mJvm != nullptr);
     }
     DataLoaderConnector(const DataLoaderConnector&) = delete;
@@ -287,6 +299,7 @@ public:
         JNIEnv* env = GetOrAttachJNIEnvironment(mJvm);
 
         env->DeleteGlobalRef(mService);
+        env->DeleteGlobalRef(mServiceConnector);
         env->DeleteGlobalRef(mCallbackControl);
         env->DeleteGlobalRef(mListener);
     } // to avoid delete-non-virtual-dtor
@@ -325,10 +338,17 @@ public:
         if (checkAndClearJavaException(__func__)) {
             result = false;
         }
+        mRunning = result;
         return result;
     }
     void onStop() {
         CHECK(mDataLoader);
+
+        // Stopping both loopers and waiting for them to exit.
+        mRunning = false;
+        std::lock_guard{mCmdLooperBusy};
+        std::lock_guard{mLogLooperBusy};
+
         mDataLoader->onStop(mDataLoader);
         checkAndClearJavaException(__func__);
     }
@@ -350,7 +370,8 @@ public:
 
     int onCmdLooperEvent(std::vector<ReadInfo>& pendingReads) {
         CHECK(mDataLoader);
-        while (true) {
+        std::lock_guard lock{mCmdLooperBusy};
+        while (mRunning.load(std::memory_order_relaxed)) {
             pendingReads.resize(kPendingReadsBufferSize);
             if (android::incfs::waitForPendingReads(mControl, 0ms, &pendingReads) !=
                         android::incfs::WaitResult::HaveData ||
@@ -363,7 +384,8 @@ public:
     }
     int onLogLooperEvent(std::vector<ReadInfo>& pageReads) {
         CHECK(mDataLoader);
-        while (true) {
+        std::lock_guard lock{mLogLooperBusy};
+        while (mRunning.load(std::memory_order_relaxed)) {
             pageReads.clear();
             if (android::incfs::waitForPageReads(mControl, 0ms, &pageReads) !=
                         android::incfs::WaitResult::HaveData ||
@@ -376,7 +398,7 @@ public:
     }
 
     void writeData(jstring name, jlong offsetBytes, jlong lengthBytes, jobject incomingFd) const {
-        CHECK(mDataLoader);
+        CHECK(mCallbackControl);
         JNIEnv* env = GetOrAttachJNIEnvironment(mJvm);
         const auto& jni = jniIds(env);
         env->CallVoidMethod(mCallbackControl, jni.callbackControlWriteData, name, offsetBytes,
@@ -396,14 +418,19 @@ public:
     }
 
     bool setParams(DataLoaderFilesystemParams params) const {
+        CHECK(mServiceConnector);
         JNIEnv* env = GetOrAttachJNIEnvironment(mJvm);
         const auto& jni = jniIds(env);
-        bool result = env->CallBooleanMethod(mService, jni.dataLoaderServiceSetStorageParams,
-                                             mStorageId, params.readLogsEnabled);
+        int result = env->CallIntMethod(mServiceConnector,
+                                        jni.incrementalServiceConnectorSetStorageParams,
+                                        params.readLogsEnabled);
+        if (result != 0) {
+            LOG(ERROR) << "setStorageParams failed with error: " << result;
+        }
         if (checkAndClearJavaException(__func__)) {
             return false;
         }
-        return result;
+        return (result == 0);
     }
 
     bool reportStatus(DataLoaderStatus status) {
@@ -432,14 +459,20 @@ public:
     jobject listener() const { return mListener; }
 
 private:
-    JavaVM* mJvm = nullptr;
+    JavaVM* const mJvm;
     jobject const mService;
+    jobject const mServiceConnector;
     jobject const mCallbackControl;
     jobject const mListener;
 
+    jint const mStorageId;
+    UniqueControl const mControl;
+
     ::DataLoader* mDataLoader = nullptr;
-    const jint mStorageId;
-    const UniqueControl mControl;
+
+    std::mutex mCmdLooperBusy;
+    std::mutex mLogLooperBusy;
+    std::atomic<bool> mRunning{false};
 };
 
 static int onCmdLooperEvent(int fd, int events, void* data) {
@@ -468,6 +501,11 @@ static int createFdFromManaged(JNIEnv* env, jobject pfd) {
     const auto& jni = jniIds(env);
     auto managedFd = env->CallObjectMethod(pfd, jni.parcelFileDescriptorGetFileDescriptor);
     return dup(jniGetFDFromFileDescriptor(env, managedFd));
+}
+
+static jobject createServiceConnector(JNIEnv* env, jobject managedControl) {
+    const auto& jni = jniIds(env);
+    return env->GetObjectField(managedControl, jni.service);
 }
 
 static jobject createCallbackControl(JNIEnv* env, jobject managedControl) {
@@ -627,11 +665,12 @@ bool DataLoaderService_OnCreate(JNIEnv* env, jobject service, jint storageId, jo
           nativeParams.dataLoaderParams().className().c_str(),
           nativeParams.dataLoaderParams().arguments().c_str());
 
+    auto serviceConnector = createServiceConnector(env, control);
     auto callbackControl = createCallbackControl(env, control);
 
     auto dataLoaderConnector =
             std::make_unique<DataLoaderConnector>(env, service, storageId, std::move(nativeControl),
-                                                  callbackControl, listener);
+                                                  serviceConnector, callbackControl, listener);
     {
         std::lock_guard lock{globals().dataLoaderConnectorsLock};
         auto [dlIt, dlInserted] =
