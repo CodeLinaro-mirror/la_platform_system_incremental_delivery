@@ -16,6 +16,7 @@
 #define LOG_TAG "incfs-dataloaderconnector"
 
 #include <android-base/logging.h>
+#include <fcntl.h>
 #include <nativehelper/JNIHelp.h>
 #include <sys/stat.h>
 #include <utils/Looper.h>
@@ -45,6 +46,7 @@ struct JniIds {
         jint DATA_LOADER_STOPPED;
         jint DATA_LOADER_IMAGE_READY;
         jint DATA_LOADER_IMAGE_NOT_READY;
+        jint DATA_LOADER_UNAVAILABLE;
         jint DATA_LOADER_UNRECOVERABLE;
 
         jint DATA_LOADER_TYPE_NONE;
@@ -104,6 +106,8 @@ struct JniIds {
         constants.DATA_LOADER_IMAGE_NOT_READY =
                 GetStaticIntFieldValueOrDie(env, listener, "DATA_LOADER_IMAGE_NOT_READY");
 
+        constants.DATA_LOADER_UNAVAILABLE =
+                GetStaticIntFieldValueOrDie(env, listener, "DATA_LOADER_UNAVAILABLE");
         constants.DATA_LOADER_UNRECOVERABLE =
                 GetStaticIntFieldValueOrDie(env, listener, "DATA_LOADER_UNRECOVERABLE");
 
@@ -237,7 +241,7 @@ struct Globals {
     DataLoaderConnectorsMap dataLoaderConnectors GUARDED_BY(dataLoaderConnectorsLock);
 
     std::atomic_bool stopped;
-    std::thread cmdLooperThread;
+    std::thread pendingReadsLooperThread;
     std::thread logLooperThread;
     std::vector<ReadInfo> pendingReads;
     std::vector<ReadInfo> pageReads;
@@ -253,9 +257,9 @@ struct IncFsLooper : public android::Looper {
     ~IncFsLooper() {}
 };
 
-static android::Looper& cmdLooper() {
-    static IncFsLooper cmdLooper;
-    return cmdLooper;
+static android::Looper& pendingReadsLooper() {
+    static IncFsLooper pendingReadsLooper;
+    return pendingReadsLooper;
 }
 
 static android::Looper& logLooper() {
@@ -344,10 +348,11 @@ public:
     void onStop() {
         CHECK(mDataLoader);
 
-        // Stopping both loopers and waiting for them to exit.
+        // Stopping both loopers and waiting for them to exit - we should be able to acquire/release
+        // both mutexes.
         mRunning = false;
-        std::lock_guard{mCmdLooperBusy};
-        std::lock_guard{mLogLooperBusy};
+        std::lock_guard{mPendingReadsLooperBusy}; // NOLINT
+        std::lock_guard{mLogLooperBusy}; // NOLINT
 
         mDataLoader->onStop(mDataLoader);
         checkAndClearJavaException(__func__);
@@ -368,9 +373,9 @@ public:
         return result;
     }
 
-    int onCmdLooperEvent(std::vector<ReadInfo>& pendingReads) {
+    int onPendingReadsLooperEvent(std::vector<ReadInfo>& pendingReads) {
         CHECK(mDataLoader);
-        std::lock_guard lock{mCmdLooperBusy};
+        std::lock_guard lock{mPendingReadsLooperBusy};
         while (mRunning.load(std::memory_order_relaxed)) {
             pendingReads.resize(kPendingReadsBufferSize);
             if (android::incfs::waitForPendingReads(mControl, 0ms, &pendingReads) !=
@@ -456,7 +461,7 @@ public:
     }
 
     const UniqueControl& control() const { return mControl; }
-    jobject listener() const { return mListener; }
+    jobject getListenerLocalRef(JNIEnv* env) const { return env->NewLocalRef(mListener); }
 
 private:
     JavaVM* const mJvm;
@@ -470,18 +475,18 @@ private:
 
     ::DataLoader* mDataLoader = nullptr;
 
-    std::mutex mCmdLooperBusy;
+    std::mutex mPendingReadsLooperBusy;
     std::mutex mLogLooperBusy;
     std::atomic<bool> mRunning{false};
 };
 
-static int onCmdLooperEvent(int fd, int events, void* data) {
+static int onPendingReadsLooperEvent(int fd, int events, void* data) {
     if (globals().stopped) {
         // No more listeners.
         return 0;
     }
     auto&& dataLoaderConnector = (DataLoaderConnector*)data;
-    return dataLoaderConnector->onCmdLooperEvent(globals().pendingReads);
+    return dataLoaderConnector->onPendingReadsLooperEvent(globals().pendingReads);
 }
 
 static int onLogLooperEvent(int fd, int events, void* data) {
@@ -500,7 +505,7 @@ static int createFdFromManaged(JNIEnv* env, jobject pfd) {
 
     const auto& jni = jniIds(env);
     auto managedFd = env->CallObjectMethod(pfd, jni.parcelFileDescriptorGetFileDescriptor);
-    return dup(jniGetFDFromFileDescriptor(env, managedFd));
+    return fcntl(jniGetFDFromFileDescriptor(env, managedFd), F_DUPFD_CLOEXEC, 0);
 }
 
 static jobject createServiceConnector(JNIEnv* env, jobject managedControl) {
@@ -555,10 +560,10 @@ DataLoaderParamsPair DataLoaderParamsPair::createFromManaged(JNIEnv* env, jobjec
                                                                       std::move(arguments)));
 }
 
-static void cmdLooperThread() {
+static void pendingReadsLooperThread() {
     constexpr auto kTimeoutMsecs = 60 * 1000;
     while (!globals().stopped) {
-        cmdLooper().pollAll(kTimeoutMsecs);
+        pendingReadsLooper().pollAll(kTimeoutMsecs);
     }
 }
 
@@ -646,27 +651,38 @@ int DataLoader_StatusListener_reportStatus(DataLoaderStatusListenerPtr listener,
 
 bool DataLoaderService_OnCreate(JNIEnv* env, jobject service, jint storageId, jobject control,
                                 jobject params, jobject listener) {
-    auto reportDestroyed = [env, storageId](jobject listener) {
-        const auto& jni = jniIds(env);
-        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_DESTROYED);
-    };
-    std::unique_ptr<_jobject, decltype(reportDestroyed)> reportDestroyedOnExit(listener,
-                                                                               reportDestroyed);
-
+    {
+        std::lock_guard lock{globals().dataLoaderConnectorsLock};
+        auto dlIt = globals().dataLoaderConnectors.find(storageId);
+        if (dlIt != globals().dataLoaderConnectors.end()) {
+            ALOGI("id(%d): already exist, skipping creation.", storageId);
+            return true;
+        }
+    }
     auto nativeControl = createIncFsControlFromManaged(env, control);
-    ALOGE("DataLoader::create1 cmd: %d/%s", nativeControl.cmd(),
+    ALOGI("DataLoader::create1 cmd: %d|%s", nativeControl.cmd(),
           pathFromFd(nativeControl.cmd()).c_str());
-    ALOGE("DataLoader::create1 log: %d/%s", nativeControl.logs(),
+    ALOGI("DataLoader::create1 pendingReads: %d|%s", nativeControl.pendingReads(),
+          pathFromFd(nativeControl.pendingReads()).c_str());
+    ALOGI("DataLoader::create1 log: %d|%s", nativeControl.logs(),
           pathFromFd(nativeControl.logs()).c_str());
 
     auto nativeParams = DataLoaderParamsPair::createFromManaged(env, params);
-    ALOGE("DataLoader::create2: %d/%s/%s/%s", nativeParams.dataLoaderParams().type(),
+    ALOGI("DataLoader::create2: %d|%s|%s|%s", nativeParams.dataLoaderParams().type(),
           nativeParams.dataLoaderParams().packageName().c_str(),
           nativeParams.dataLoaderParams().className().c_str(),
           nativeParams.dataLoaderParams().arguments().c_str());
 
     auto serviceConnector = createServiceConnector(env, control);
     auto callbackControl = createCallbackControl(env, control);
+
+    auto reportUnavailable = [env, storageId](jobject listener) {
+        const auto& jni = jniIds(env);
+        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_UNAVAILABLE);
+    };
+    // By default, it's disabled. Need to assign listener to enable.
+    std::unique_ptr<_jobject, decltype(reportUnavailable)>
+            reportUnavailableOnExit(nullptr, reportUnavailable);
 
     auto dataLoaderConnector =
             std::make_unique<DataLoaderConnector>(env, service, storageId, std::move(nativeControl),
@@ -677,18 +693,16 @@ bool DataLoaderService_OnCreate(JNIEnv* env, jobject service, jint storageId, jo
                 globals().dataLoaderConnectors.try_emplace(storageId,
                                                            std::move(dataLoaderConnector));
         if (!dlInserted) {
-            ALOGE("Failed to insert id(%d)->DataLoader mapping, fd already "
-                  "exists",
-                  storageId);
+            ALOGE("id(%d): already exist, skipping creation.", storageId);
             return false;
         }
         if (!dlIt->second->onCreate(nativeParams, params)) {
             globals().dataLoaderConnectors.erase(dlIt);
+            // Enable the reporter.
+            reportUnavailableOnExit.reset(listener);
             return false;
         }
     }
-
-    reportDestroyedOnExit.release();
 
     const auto& jni = jniIds(env);
     reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_CREATED);
@@ -697,11 +711,16 @@ bool DataLoaderService_OnCreate(JNIEnv* env, jobject service, jint storageId, jo
 }
 
 bool DataLoaderService_OnStart(JNIEnv* env, jint storageId) {
-    auto reportStopped = [env, storageId](jobject listener) {
+    auto destroyAndReportUnavailable = [env, storageId](jobject listener) {
+        // Because of the MT the installer can call commit and recreate/restart dataLoader before
+        // system server has a change to destroy it.
+        DataLoaderService_OnDestroy(env, storageId);
         const auto& jni = jniIds(env);
-        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_STOPPED);
+        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_UNAVAILABLE);
     };
-    std::unique_ptr<_jobject, decltype(reportStopped)> reportStoppedOnExit(nullptr, reportStopped);
+    // By default, it's disabled. Need to assign listener to enable.
+    std::unique_ptr<_jobject, decltype(destroyAndReportUnavailable)>
+            destroyAndReportUnavailableOnExit(nullptr, destroyAndReportUnavailable);
 
     const UniqueControl* control;
     jobject listener;
@@ -714,21 +733,21 @@ bool DataLoaderService_OnStart(JNIEnv* env, jint storageId) {
             return false;
         }
 
-        listener = dlIt->second->listener();
-        reportStoppedOnExit.reset(listener);
+        listener = dlIt->second->getListenerLocalRef(env);
 
         dataLoaderConnector = dlIt->second;
         if (!dataLoaderConnector->onStart()) {
             ALOGE("Failed to start id(%d): onStart returned false", storageId);
+            destroyAndReportUnavailableOnExit.reset(listener);
             return false;
         }
 
         control = &(dataLoaderConnector->control());
 
         // Create loopers while we are under lock.
-        if (control->cmd() >= 0 && !globals().cmdLooperThread.joinable()) {
-            cmdLooper();
-            globals().cmdLooperThread = std::thread(&cmdLooperThread);
+        if (control->pendingReads() >= 0 && !globals().pendingReadsLooperThread.joinable()) {
+            pendingReadsLooper();
+            globals().pendingReadsLooperThread = std::thread(&pendingReadsLooperThread);
         }
         if (control->logs() >= 0 && !globals().logLooperThread.joinable()) {
             logLooper();
@@ -736,11 +755,11 @@ bool DataLoaderService_OnStart(JNIEnv* env, jint storageId) {
         }
     }
 
-    if (control->cmd() >= 0) {
-        cmdLooper().addFd(control->cmd(), android::Looper::POLL_CALLBACK,
-                          android::Looper::EVENT_INPUT, &onCmdLooperEvent,
-                          dataLoaderConnector.get());
-        cmdLooper().wake();
+    if (control->pendingReads() >= 0) {
+        pendingReadsLooper().addFd(control->pendingReads(), android::Looper::POLL_CALLBACK,
+                                   android::Looper::EVENT_INPUT, &onPendingReadsLooperEvent,
+                                   dataLoaderConnector.get());
+        pendingReadsLooper().wake();
     }
 
     if (control->logs() >= 0) {
@@ -750,80 +769,92 @@ bool DataLoaderService_OnStart(JNIEnv* env, jint storageId) {
         logLooper().wake();
     }
 
-    reportStoppedOnExit.release();
-
     const auto& jni = jniIds(env);
     reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_STARTED);
 
     return true;
 }
 
-bool DataLoaderService_OnStop(JNIEnv* env, jint storageId) {
-    auto reportStopped = [env, storageId](jobject listener) {
-        const auto& jni = jniIds(env);
-        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_STOPPED);
-    };
-    std::unique_ptr<_jobject, decltype(reportStopped)> reportStoppedOnExit(nullptr, reportStopped);
-
+jobject DataLoaderService_OnStop_NoStatus(JNIEnv* env, jint storageId) {
     const UniqueControl* control;
     {
         std::lock_guard lock{globals().dataLoaderConnectorsLock};
         auto dlIt = globals().dataLoaderConnectors.find(storageId);
         if (dlIt == globals().dataLoaderConnectors.end()) {
-            ALOGE("Failed to stop id(%d): not found", storageId);
-            return false;
+            return nullptr;
         }
         control = &(dlIt->second->control());
-
-        reportStoppedOnExit.reset(dlIt->second->listener());
     }
 
-    if (control->cmd() >= 0) {
-        cmdLooper().removeFd(control->cmd());
-        cmdLooper().wake();
+    if (control->pendingReads() >= 0) {
+        pendingReadsLooper().removeFd(control->pendingReads());
+        pendingReadsLooper().wake();
     }
     if (control->logs() >= 0) {
         logLooper().removeFd(control->logs());
         logLooper().wake();
     }
 
+    jobject listener = nullptr;
     {
         std::lock_guard lock{globals().dataLoaderConnectorsLock};
         auto dlIt = globals().dataLoaderConnectors.find(storageId);
         if (dlIt == globals().dataLoaderConnectors.end()) {
-            ALOGE("Failed to stop id(%d): not found", storageId);
-            return false;
+            ALOGI("Failed to stop id(%d): not found", storageId);
+            return nullptr;
         }
+
+        listener = dlIt->second->getListenerLocalRef(env);
+
         auto&& dataLoaderConnector = dlIt->second;
-        if (dataLoaderConnector) {
-            dataLoaderConnector->onStop();
-        }
+        dataLoaderConnector->onStop();
     }
+    return listener;
+}
+
+bool DataLoaderService_OnStop(JNIEnv* env, jint storageId) {
+    auto listener = DataLoaderService_OnStop_NoStatus(env, storageId);
+    if (listener == nullptr) {
+        ALOGI("Failed to stop id(%d): not found", storageId);
+        return true;
+    }
+
+    const auto& jni = jniIds(env);
+    reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_STOPPED);
 
     return true;
 }
 
-bool DataLoaderService_OnDestroy(JNIEnv* env, jint storageId) {
-    DataLoaderService_OnStop(env, storageId);
-
-    auto reportDestroyed = [env, storageId](jobject listener) {
-        const auto& jni = jniIds(env);
-        reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_DESTROYED);
-    };
-    std::unique_ptr<_jobject, decltype(reportDestroyed)> reportDestroyedOnExit(nullptr,
-                                                                               reportDestroyed);
-
-    std::lock_guard lock{globals().dataLoaderConnectorsLock};
-    auto dlIt = globals().dataLoaderConnectors.find(storageId);
-    if (dlIt == globals().dataLoaderConnectors.end()) {
-        ALOGE("Failed to remove id(%d): not found", storageId);
-        return false;
+jobject DataLoaderService_OnDestroy_NoStatus(JNIEnv* env, jint storageId) {
+    jobject listener = DataLoaderService_OnStop_NoStatus(env, storageId);
+    if (!listener) {
+        return nullptr;
     }
-    reportDestroyedOnExit.reset(env->NewLocalRef(dlIt->second->listener()));
 
-    auto&& dataLoaderConnector = dlIt->second;
-    dataLoaderConnector->onDestroy();
-    globals().dataLoaderConnectors.erase(dlIt);
+    {
+        std::lock_guard lock{globals().dataLoaderConnectorsLock};
+        auto dlIt = globals().dataLoaderConnectors.find(storageId);
+        if (dlIt == globals().dataLoaderConnectors.end()) {
+            return nullptr;
+        }
+
+        auto&& dataLoaderConnector = dlIt->second;
+        dataLoaderConnector->onDestroy();
+        globals().dataLoaderConnectors.erase(dlIt);
+    }
+
+    return listener;
+}
+
+bool DataLoaderService_OnDestroy(JNIEnv* env, jint storageId) {
+    jobject listener = DataLoaderService_OnDestroy_NoStatus(env, storageId);
+    if (!listener) {
+        ALOGI("Failed to remove id(%d): not found", storageId);
+        return true;
+    }
+
+    const auto& jni = jniIds(env);
+    reportStatusViaCallback(env, listener, storageId, jni.constants.DATA_LOADER_DESTROYED);
 
     return true;
 }
@@ -903,7 +934,7 @@ bool DataLoaderService_OnPrepareImage(JNIEnv* env, jint storageId, jobjectArray 
             ALOGE("Failed to handle onPrepareImage for id(%d): not found", storageId);
             return false;
         }
-        listener = dlIt->second->listener();
+        listener = dlIt->second->getListenerLocalRef(env);
         dataLoaderConnector = dlIt->second;
     }
 
