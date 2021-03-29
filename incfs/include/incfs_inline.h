@@ -28,9 +28,6 @@ constexpr char kIdAttrName[] = INCFS_XATTR_ID_NAME;
 constexpr char kSizeAttrName[] = INCFS_XATTR_SIZE_NAME;
 constexpr char kMetadataAttrName[] = INCFS_XATTR_METADATA_NAME;
 
-constexpr char kIndexDir[] = ".index";
-constexpr char kIncompleteDir[] = ".incomplete";
-
 namespace details {
 
 class CStrWrapper {
@@ -338,8 +335,7 @@ inline std::pair<ErrorCode, FilledRanges> getFilledRanges(int fd, FilledRanges&&
     return {res, FilledRanges(std::move(buffer), rawRanges)};
 }
 
-inline LoadingState isFullyLoaded(int fd) {
-    auto res = IncFs_IsFullyLoaded(fd);
+inline LoadingState toLoadingState(IncFsErrorCode res) {
     switch (res) {
         case 0:
             return LoadingState::Full;
@@ -348,6 +344,20 @@ inline LoadingState isFullyLoaded(int fd) {
         default:
             return LoadingState(res);
     }
+}
+
+inline LoadingState isFullyLoaded(int fd) {
+    return toLoadingState(IncFs_IsFullyLoaded(fd));
+}
+inline LoadingState isFullyLoaded(const Control& control, std::string_view path) {
+    return toLoadingState(IncFs_IsFullyLoadedByPath(control, details::c_str(path)));
+}
+inline LoadingState isFullyLoaded(const Control& control, FileId fileId) {
+    return toLoadingState(IncFs_IsFullyLoadedById(control, fileId));
+}
+
+inline LoadingState isEverythingFullyLoaded(const Control& control) {
+    return toLoadingState(IncFs_IsEverythingFullyLoaded(control));
 }
 
 inline std::optional<std::vector<FileId>> listIncompleteFiles(const Control& control) {
@@ -364,6 +374,30 @@ inline std::optional<std::vector<FileId>> listIncompleteFiles(const Control& con
     }
     ids.resize(count);
     return std::move(ids);
+}
+
+template <class Callback>
+inline ErrorCode forEachFile(const Control& control, Callback&& cb) {
+    struct Context {
+        const Control& c;
+        const Callback& cb;
+    } context = {control, cb};
+    return IncFs_ForEachFile(control, &context, [](void* pcontext, const IncFsControl*, FileId id) {
+        const auto context = (Context*)pcontext;
+        return context->cb(context->c, id);
+    });
+}
+template <class Callback>
+inline ErrorCode forEachIncompleteFile(const Control& control, Callback&& cb) {
+    struct Context {
+        const Control& c;
+        const Callback& cb;
+    } context = {control, cb};
+    return IncFs_ForEachIncompleteFile(control, &context,
+                                       [](void* pcontext, const IncFsControl*, FileId id) {
+                                           const auto context = (Context*)pcontext;
+                                           return context->cb(context->c, id);
+                                       });
 }
 
 inline WaitResult waitForLoadingComplete(const Control& control,
@@ -417,6 +451,13 @@ inline std::optional<std::vector<UidReadTimeouts>> getUidReadTimeouts(const Cont
     }
     timeouts.resize(count);
     return std::move(timeouts);
+}
+
+inline ErrorCode reserveSpace(const Control& control, std::string_view path, Size size) {
+    return IncFs_ReserveSpaceByPath(control, details::c_str(path), size);
+}
+inline ErrorCode reserveSpace(const Control& control, FileId id, Size size) {
+    return IncFs_ReserveSpaceById(control, id, size);
 }
 
 } // namespace android::incfs

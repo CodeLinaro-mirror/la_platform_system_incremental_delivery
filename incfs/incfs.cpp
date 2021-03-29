@@ -85,6 +85,10 @@ static ab::unique_fd openRaw(std::string_view dir, std::string_view name) {
     return openRaw(path::join(dir, name));
 }
 
+static std::string indexPath(std::string_view root, IncFsFileId fileId) {
+    return path::join(root, INCFS_INDEX_NAME, toString(fileId));
+}
+
 static std::string rootForCmd(int fd) {
     auto cmdFile = path::fromFd(fd);
     if (cmdFile.empty()) {
@@ -146,6 +150,29 @@ static std::pair<bool, std::string_view> parseProperty(std::string_view property
         return {::access(details::c_str(modulePath), R_OK | X_OK), modulePath};
     }
     return {false, {}};
+}
+
+template <class Callback>
+static IncFsErrorCode forEachFileIn(std::string_view dirPath, Callback cb) {
+    auto dir = path::openDir(details::c_str(dirPath));
+    if (!dir) {
+        return -EINVAL;
+    }
+
+    int res = 0;
+    while (auto entry = (errno = 0, ::readdir(dir.get()))) {
+        if (entry->d_type != DT_REG) {
+            continue;
+        }
+        ++res;
+        if (!cb(entry->d_name)) {
+            break;
+        }
+    }
+    if (errno) {
+        return -errno;
+    }
+    return res;
 }
 
 namespace {
@@ -241,7 +268,7 @@ static Features readIncFsFeatures() {
         }
     }
 
-    PLOG(INFO) << "IncFs_Features: " << ((res & Features::v2) ? "v2" : "v1");
+    LOG(INFO) << "IncFs_Features: " << ((res & Features::v2) ? "v2" : "v1");
 
     return Features(res);
 }
@@ -900,7 +927,7 @@ IncFsErrorCode IncFs_GetMetadataById(const IncFsControl* control, IncFsFileId fi
     if (root.empty()) {
         return -EINVAL;
     }
-    auto name = path::join(root, kIndexDir, toStringImpl(fileId));
+    auto name = indexPath(root, fileId);
     return getMetadata(details::c_str(name), buffer, bufferSize);
 }
 
@@ -918,6 +945,16 @@ IncFsErrorCode IncFs_GetMetadataByPath(const IncFsControl* control, const char* 
     return getMetadata(path, buffer, bufferSize);
 }
 
+template <class GetterFunc, class Param>
+static IncFsFileId getId(GetterFunc getter, Param param) {
+    char buffer[kIncFsFileIdStringLength];
+    const auto res = getter(param, kIdAttrName, buffer, sizeof(buffer));
+    if (res != sizeof(buffer)) {
+        return kIncFsInvalidFileId;
+    }
+    return toFileIdImpl({buffer, std::size(buffer)});
+}
+
 IncFsFileId IncFs_GetId(const IncFsControl* control, const char* path) {
     if (!control) {
         return kIncFsInvalidFileId;
@@ -928,12 +965,7 @@ IncFsFileId IncFs_GetId(const IncFsControl* control, const char* path) {
         errno = EINVAL;
         return kIncFsInvalidFileId;
     }
-    char buffer[kIncFsFileIdStringLength];
-    const auto res = ::getxattr(path, kIdAttrName, buffer, sizeof(buffer));
-    if (res != sizeof(buffer)) {
-        return kIncFsInvalidFileId;
-    }
-    return toFileIdImpl({buffer, std::size(buffer)});
+    return getId(::getxattr, path);
 }
 
 static IncFsErrorCode getSignature(int fd, char buffer[], size_t* bufferSize) {
@@ -963,7 +995,7 @@ IncFsErrorCode IncFs_GetSignatureById(const IncFsControl* control, IncFsFileId f
     if (root.empty()) {
         return -EINVAL;
     }
-    auto file = path::join(root, kIndexDir, toStringImpl(fileId));
+    auto file = indexPath(root, fileId);
     auto fd = openRaw(file);
     if (fd < 0) {
         return fd.get();
@@ -1208,7 +1240,7 @@ IncFsFd IncFs_OpenForSpecialOpsById(const IncFsControl* control, IncFsFileId id)
     if (root.empty()) {
         return -EINVAL;
     }
-    auto name = path::join(root, kIndexDir, toStringImpl(id));
+    auto name = indexPath(root, id);
     return openForSpecialOps(cmd, makeCommandPath(root, name).c_str());
 }
 
@@ -1437,7 +1469,17 @@ IncFsErrorCode IncFs_GetFilledRangesStartingFrom(int fd, int startBlockIndex, In
     return -error;
 }
 
-IncFsErrorCode IncFs_IsFullyLoaded(int fd) {
+static IncFsErrorCode isFullyLoadedV2(std::string_view root, IncFsFileId id) {
+    if (::access(path::join(root, INCFS_INCOMPLETE_NAME, toStringImpl(id)).c_str(), F_OK)) {
+        if (errno == ENOENT) {
+            return 0; // no such incomplete file -> it's fully loaded.
+        }
+        return -errno;
+    }
+    return -ENODATA;
+}
+
+static IncFsErrorCode isFullyLoadedSlow(int fd) {
     char buffer[2 * sizeof(IncFsBlockRange)];
     IncFsFilledRanges ranges;
     auto res = IncFs_GetFilledRanges(fd, IncFsSpan{.data = buffer, .size = std::size(buffer)},
@@ -1473,6 +1515,113 @@ IncFsErrorCode IncFs_IsFullyLoaded(int fd) {
                 : -ENODATA;
     }
     return -ENODATA;
+}
+
+IncFsErrorCode IncFs_IsFullyLoaded(int fd) {
+    if (features() & Features::v2) {
+        const auto fdPath = path::fromFd(fd);
+        if (fdPath.empty()) {
+            return errno ? -errno : -EINVAL;
+        }
+        const auto id = getId(::fgetxattr, fd);
+        if (id == kIncFsInvalidFileId) {
+            return -errno;
+        }
+        return isFullyLoadedV2(registry().rootFor(fdPath), id);
+    }
+    return isFullyLoadedSlow(fd);
+}
+IncFsErrorCode IncFs_IsFullyLoadedByPath(const IncFsControl* control, const char* path) {
+    if (!control || !path) {
+        return -EINVAL;
+    }
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    const auto pathRoot = registry().rootFor(path);
+    if (pathRoot != root) {
+        return -EINVAL;
+    }
+    if (features() & Features::v2) {
+        const auto id = getId(::getxattr, path);
+        if (id == kIncFsInvalidFileId) {
+            return -errno;
+        }
+        return isFullyLoadedV2(root, id);
+    }
+    return isFullyLoadedSlow(openForSpecialOps(control->cmd, makeCommandPath(root, path).c_str()));
+}
+IncFsErrorCode IncFs_IsFullyLoadedById(const IncFsControl* control, IncFsFileId fileId) {
+    if (!control) {
+        return -EINVAL;
+    }
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    if (features() & Features::v2) {
+        return isFullyLoadedV2(root, fileId);
+    }
+    return isFullyLoadedSlow(
+            openForSpecialOps(control->cmd,
+                              makeCommandPath(root, indexPath(root, fileId)).c_str()));
+}
+
+static IncFsErrorCode isEverythingLoadedV2(const IncFsControl* control) {
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    auto res = forEachFileIn(path::join(root, INCFS_INCOMPLETE_NAME), [](auto) { return false; });
+    return res < 0 ? res : res > 0 ? -ENODATA : 0;
+}
+
+static IncFsErrorCode isEverythingLoadedSlow(const IncFsControl* control) {
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    // No special API for this version of the driver, need to recurse and check each file
+    // separately. Can at least speed it up by iterating over the .index/ dir and not dealing with
+    // the directory tree.
+    const auto indexPath = path::join(root, INCFS_INDEX_NAME);
+    const auto dir = path::openDir(indexPath.c_str());
+    if (!dir) {
+        return -EINVAL;
+    }
+    while (const auto entry = ::readdir(dir.get())) {
+        if (entry->d_type != DT_REG) {
+            continue;
+        }
+        const auto name = path::join(indexPath, entry->d_name);
+        auto fd =
+                ab::unique_fd(openForSpecialOps(control->cmd, makeCommandPath(root, name).c_str()));
+        if (fd.get() < 0) {
+            PLOG(WARNING) << __func__ << "(): can't open " << entry->d_name << " for special ops";
+            return fd.release();
+        }
+        const auto checkFullyLoaded = IncFs_IsFullyLoaded(fd.get());
+        if (checkFullyLoaded == 0 || checkFullyLoaded == -EOPNOTSUPP ||
+            checkFullyLoaded == -ENOTSUP || checkFullyLoaded == -ENOENT) {
+            // special kinds of files may return an error here, but it still means
+            // _this_ file is OK - you simply need to check the rest. E.g. can't query
+            // a mapped file, instead need to check its parent.
+            continue;
+        }
+        return checkFullyLoaded;
+    }
+    return 0;
+}
+
+IncFsErrorCode IncFs_IsEverythingFullyLoaded(const IncFsControl* control) {
+    if (!control) {
+        return -EINVAL;
+    }
+    if (features() & Features::v2) {
+        return isEverythingLoadedV2(control);
+    }
+    return isEverythingLoadedSlow(control);
 }
 
 IncFsErrorCode IncFs_SetUidReadTimeouts(const IncFsControl* control,
@@ -1561,7 +1710,7 @@ IncFsErrorCode IncFs_GetFileBlockCountById(const IncFsControl* control, IncFsFil
     if (root.empty()) {
         return -EINVAL;
     }
-    auto name = path::join(root, kIndexDir, toStringImpl(id));
+    auto name = indexPath(root, id);
     auto fd = openRaw(name);
     if (fd < 0) {
         return fd.get();
@@ -1601,28 +1750,52 @@ IncFsErrorCode IncFs_ListIncompleteFiles(const IncFsControl* control, IncFsFileI
     if (root.empty()) {
         return -EINVAL;
     }
-    auto dirPath = path::join(root, kIncompleteDir);
-    auto dir = path::openDir(dirPath.c_str());
-    if (!dir) {
-        return -EINVAL;
-    }
-
-    int res = 0;
     size_t index = 0;
-    while (auto entry = ::readdir(dir.get())) {
-        if (entry->d_type != DT_REG) {
-            continue;
-        }
+    int error = 0;
+    const auto res = forEachFileIn(path::join(root, INCFS_INCOMPLETE_NAME), [&](const char* name) {
         if (index >= *bufferSize) {
-            res = -E2BIG;
+            error = -E2BIG;
         } else {
-            ids[index] = IncFs_FileIdFromString(entry->d_name);
+            ids[index] = IncFs_FileIdFromString(name);
         }
         ++index;
+        return true;
+    });
+    if (res < 0) {
+        return res;
     }
-
     *bufferSize = index;
-    return res;
+    return error ? error : 0;
+}
+
+IncFsErrorCode IncFs_ForEachFile(const IncFsControl* control, void* context, FileCallback cb) {
+    if (!control || !cb) {
+        return -EINVAL;
+    }
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    return forEachFileIn(path::join(root, INCFS_INDEX_NAME), [&](const char* name) {
+        return cb(context, control, IncFs_FileIdFromString(name));
+    });
+}
+
+IncFsErrorCode IncFs_ForEachIncompleteFile(const IncFsControl* control, void* context,
+                                           FileCallback cb) {
+    if (!control || !cb) {
+        return -EINVAL;
+    }
+    if (!(features() & Features::v2)) {
+        return -ENOTSUP;
+    }
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    return forEachFileIn(path::join(root, INCFS_INCOMPLETE_NAME), [&](const char* name) {
+        return cb(context, control, IncFs_FileIdFromString(name));
+    });
 }
 
 IncFsErrorCode IncFs_WaitForLoadingComplete(const IncFsControl* control, int32_t timeoutMs) {
@@ -1647,7 +1820,7 @@ IncFsErrorCode IncFs_WaitForLoadingComplete(const IncFsControl* control, int32_t
     }
 
     // first create all the watches, and only then list existing files to prevent races
-    auto dirPath = path::join(root, kIncompleteDir);
+    auto dirPath = path::join(root, INCFS_INCOMPLETE_NAME);
     int watchFd = inotify_add_watch(fd.get(), dirPath.c_str(), IN_DELETE);
     if (watchFd < 0) {
         return -errno;
@@ -1749,6 +1922,64 @@ IncFsErrorCode IncFs_WaitForFsWrittenBlocksChange(const IncFsControl* control, i
     }
 
     return 0;
+}
+
+static IncFsErrorCode reserveSpace(const char* backingPath, IncFsSize size) {
+    auto fd = ab::unique_fd(::open(backingPath, O_WRONLY | O_CLOEXEC));
+    if (fd < 0) {
+        return -errno;
+    }
+    struct stat st = {};
+    if (::fstat(fd.get(), &st)) {
+        return -errno;
+    }
+    if (size == kIncFsTrimReservedSpace) {
+        if (::ftruncate(fd.get(), st.st_size)) {
+            return -errno;
+        }
+    } else {
+        // Add 1.5% of the size for the hash tree and the blockmap, and some more blocks
+        // for fixed overhead.
+        // hash tree is ~33 bytes / page, and blockmap is 10 bytes / page
+        // no need to round to a page size as filesystems already do that.
+        const auto backingSize = IncFsSize(size * 1.015) + INCFS_DATA_FILE_BLOCK_SIZE * 4;
+        if (backingSize < st.st_size) {
+            return -EPERM;
+        }
+        if (::fallocate(fd.get(), FALLOC_FL_KEEP_SIZE, 0, backingSize)) {
+            return -errno;
+        }
+    }
+    return 0;
+}
+
+IncFsErrorCode IncFs_ReserveSpaceByPath(const IncFsControl* control, const char* path,
+                                        IncFsSize size) {
+    if (!control || (size != kIncFsTrimReservedSpace && size < 0)) {
+        return -EINVAL;
+    }
+    const auto [pathRoot, backingRoot, subpath] = registry().detailsFor(path);
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty() || root != pathRoot) {
+        return -EINVAL;
+    }
+    return reserveSpace(path::join(backingRoot, subpath).c_str(), size);
+}
+
+IncFsErrorCode IncFs_ReserveSpaceById(const IncFsControl* control, IncFsFileId id, IncFsSize size) {
+    if (!control || (size != kIncFsTrimReservedSpace && size < 0)) {
+        return -EINVAL;
+    }
+    const auto root = rootForCmd(control->cmd);
+    if (root.empty()) {
+        return -EINVAL;
+    }
+    auto path = indexPath(root, id);
+    const auto [pathRoot, backingRoot, subpath] = registry().detailsFor(path);
+    if (root != pathRoot) {
+        return -EINVAL;
+    }
+    return reserveSpace(path::join(backingRoot, subpath).c_str(), size);
 }
 
 MountRegistry& android::incfs::defaultMountRegistry() {
