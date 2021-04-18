@@ -60,20 +60,32 @@ bool startsWith(std::string_view path, std::string_view prefix);
 bool endsWith(std::string_view path, std::string_view prefix);
 
 inline auto openDir(const char* path) {
-    auto dir = std::unique_ptr<DIR, decltype(&closedir)>(::opendir(path), &::closedir);
+    struct closer {
+        void operator()(DIR* d) const { ::closedir(d); }
+    };
+    auto dir = std::unique_ptr<DIR, closer>(::opendir(path));
     return dir;
 }
 
 template <class... Paths>
-std::string join(std::string_view first, std::string_view second, Paths&&... paths) {
-    std::string result;
+std::string join(std::string&& first, std::string_view second, Paths&&... paths) {
+    std::string& result = first;
     {
         using std::size;
         result.reserve(first.size() + second.size() + 1 + (sizeof...(paths) + ... + size(paths)));
     }
-    result.assign(first);
-    (details::appendNextPath(result, second), ..., details::appendNextPath(result, paths));
+    (details::appendNextPath(result, second), ...,
+     details::appendNextPath(result, std::forward<Paths>(paths)));
     return result;
+}
+
+template <class... Paths>
+std::string join(std::string_view first, std::string_view second, Paths&&... paths) {
+    return join(std::string(), first, second, std::forward<Paths>(paths)...);
+}
+template <class... Paths>
+std::string join(const char* first, std::string_view second, Paths&&... paths) {
+    return path::join(std::string_view(first), second, std::forward<Paths>(paths)...);
 }
 
 } // namespace android::incfs::path

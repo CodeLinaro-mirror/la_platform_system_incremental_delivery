@@ -497,6 +497,7 @@ TEST_F(IncFsTest, GetFilledRanges) {
     EXPECT_EQ(0, filledRanges.hashRangesCount);
 
     EXPECT_EQ(-ENODATA, IncFs_IsFullyLoaded(fd.get()));
+    EXPECT_EQ(-ENODATA, IncFs_IsEverythingFullyLoaded(control_));
 
     // write one block
     std::vector<char> data(INCFS_DATA_FILE_BLOCK_SIZE);
@@ -530,6 +531,7 @@ TEST_F(IncFsTest, GetFilledRanges) {
     EXPECT_EQ(0, filledRanges.hashRangesCount);
 
     EXPECT_EQ(-ENODATA, IncFs_IsFullyLoaded(fd.get()));
+    EXPECT_EQ(-ENODATA, IncFs_IsEverythingFullyLoaded(control_));
 
     // append one more block next to the first one
     block.pageIndex = 1;
@@ -558,6 +560,7 @@ TEST_F(IncFsTest, GetFilledRanges) {
     EXPECT_EQ(0, filledRanges.hashRangesCount);
 
     EXPECT_EQ(-ENODATA, IncFs_IsFullyLoaded(fd.get()));
+    EXPECT_EQ(-ENODATA, IncFs_IsEverythingFullyLoaded(control_));
 
     // now create a gap between filled blocks
     block.pageIndex = 3;
@@ -598,6 +601,7 @@ TEST_F(IncFsTest, GetFilledRanges) {
     EXPECT_EQ(0, filledRanges.hashRangesCount);
 
     EXPECT_EQ(-ENODATA, IncFs_IsFullyLoaded(fd.get()));
+    EXPECT_EQ(-ENODATA, IncFs_IsEverythingFullyLoaded(control_));
 
     // at last fill the whole file and make sure we report it as having a single range
     block.pageIndex = 2;
@@ -625,6 +629,7 @@ TEST_F(IncFsTest, GetFilledRanges) {
     EXPECT_EQ(0, filledRanges.hashRangesCount);
 
     EXPECT_EQ(0, IncFs_IsFullyLoaded(fd.get()));
+    EXPECT_EQ(0, IncFs_IsEverythingFullyLoaded(control_));
 }
 
 TEST_F(IncFsTest, GetFilledRangesSmallBuffer) {
@@ -756,6 +761,7 @@ TEST_F(IncFsTest, GetFilledRangesCpp) {
     EXPECT_EQ(size_t(1), ranges3.hashRanges()[1].size());
 
     EXPECT_EQ(LoadingState::MissingBlocks, isFullyLoaded(fd.get()));
+    EXPECT_EQ(LoadingState::MissingBlocks, isEverythingFullyLoaded(control_));
 
     {
         std::vector<char> data(INCFS_DATA_FILE_BLOCK_SIZE);
@@ -775,6 +781,7 @@ TEST_F(IncFsTest, GetFilledRangesCpp) {
         }
     }
     EXPECT_EQ(LoadingState::Full, isFullyLoaded(fd.get()));
+    EXPECT_EQ(LoadingState::Full, isEverythingFullyLoaded(control_));
 }
 
 TEST_F(IncFsTest, BlocksWritten) {
@@ -932,8 +939,6 @@ TEST_F(IncFsTest, CompletionWait) {
         return;
     }
 
-    GTEST_SKIP() << "broken: b/175323815";
-
     ASSERT_EQ(0,
               makeFile(control_, mountPath("test1"), 0555, fileId(1),
                        {.size = INCFS_DATA_FILE_BLOCK_SIZE}));
@@ -1083,4 +1088,75 @@ TEST_F(IncFsTest, GetBlockCountsHash) {
     EXPECT_EQ(4, counts.filledDataBlocks);
     EXPECT_EQ(3, counts.totalHashBlocks);
     EXPECT_EQ(2, counts.filledHashBlocks);
+}
+
+TEST_F(IncFsTest, ReserveSpace) {
+    auto size = makeFileWithHash(1);
+    ASSERT_GT(size, 0);
+
+    EXPECT_EQ(-ENOENT,
+              IncFs_ReserveSpaceByPath(control_, mountPath("1"s += test_file_name_).c_str(), size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceByPath(control_, mountPath(test_file_name_).c_str(), size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceByPath(control_, mountPath(test_file_name_).c_str(), 2 * size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceByPath(control_, mountPath(test_file_name_).c_str(), 2 * size));
+    EXPECT_EQ(0,
+              IncFs_ReserveSpaceByPath(control_, mountPath(test_file_name_).c_str(),
+                                       kTrimReservedSpace));
+    EXPECT_EQ(0,
+              IncFs_ReserveSpaceByPath(control_, mountPath(test_file_name_).c_str(),
+                                       kTrimReservedSpace));
+
+    EXPECT_EQ(-ENOENT, IncFs_ReserveSpaceById(control_, fileId(2), size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceById(control_, fileId(1), size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceById(control_, fileId(1), 2 * size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceById(control_, fileId(1), 2 * size));
+    EXPECT_EQ(0, IncFs_ReserveSpaceById(control_, fileId(1), kTrimReservedSpace));
+    EXPECT_EQ(0, IncFs_ReserveSpaceById(control_, fileId(1), kTrimReservedSpace));
+}
+
+TEST_F(IncFsTest, ForEachFile) {
+    const auto incompleteSupported = (features() & Features::v2) != 0;
+    EXPECT_EQ(-EINVAL, IncFs_ForEachFile(nullptr, nullptr, nullptr));
+    EXPECT_EQ(-EINVAL, IncFs_ForEachIncompleteFile(nullptr, nullptr, nullptr));
+    EXPECT_EQ(-EINVAL, IncFs_ForEachFile(control_, nullptr, nullptr));
+    EXPECT_EQ(-EINVAL, IncFs_ForEachIncompleteFile(control_, nullptr, nullptr));
+    EXPECT_EQ(0, IncFs_ForEachFile(control_, nullptr, [](auto, auto, auto) { return true; }));
+    EXPECT_EQ(incompleteSupported ? 0 : -ENOTSUP,
+              IncFs_ForEachIncompleteFile(control_, nullptr,
+                                          [](auto, auto, auto) { return true; }));
+    EXPECT_EQ(0, IncFs_ForEachFile(control_, this, [](auto, auto, auto) { return true; }));
+    EXPECT_EQ(incompleteSupported ? 0 : -ENOTSUP,
+              IncFs_ForEachIncompleteFile(control_, this, [](auto, auto, auto) { return true; }));
+
+    int res = makeFile(control_, mountPath("incomplete.txt"), 0555, fileId(1),
+                       {.metadata = metadata("md")});
+    ASSERT_EQ(res, 0);
+
+    EXPECT_EQ(1, IncFs_ForEachFile(control_, this, [](auto, auto context, auto id) {
+                  auto self = (IncFsTest*)context;
+                  EXPECT_EQ(self->fileId(1), id);
+                  return true;
+              }));
+    EXPECT_EQ(incompleteSupported ? 0 : -ENOTSUP,
+              IncFs_ForEachIncompleteFile(control_, this, [](auto, auto, auto) { return true; }));
+
+    auto size = makeFileWithHash(2);
+    ASSERT_GT(size, 0);
+
+    EXPECT_EQ(1, IncFs_ForEachFile(control_, this, [](auto, auto context, auto id) {
+                  auto self = (IncFsTest*)context;
+                  EXPECT_TRUE(id == self->fileId(1) || id == self->fileId(2));
+                  return false;
+              }));
+    EXPECT_EQ(2, IncFs_ForEachFile(control_, this, [](auto, auto context, auto id) {
+                  auto self = (IncFsTest*)context;
+                  EXPECT_TRUE(id == self->fileId(1) || id == self->fileId(2));
+                  return true;
+              }));
+    EXPECT_EQ(incompleteSupported ? 1 : -ENOTSUP,
+              IncFs_ForEachIncompleteFile(control_, this, [](auto, auto context, auto id) {
+                  auto self = (IncFsTest*)context;
+                  EXPECT_EQ(self->fileId(2), id);
+                  return true;
+              }));
 }
