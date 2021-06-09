@@ -101,8 +101,10 @@ public:
     IncFsFd pendingReads() const;
     IncFsFd logs() const;
     IncFsFd blocksWritten() const;
-    operator IncFsControl*() const { return mControl; };
+
     void close();
+
+    operator IncFsControl*() const { return mControl; }
 
     using Fds = std::array<UniqueFd, IncFsFdType::FDS_COUNT>;
     [[nodiscard]] Fds releaseFds();
@@ -190,6 +192,8 @@ using NewFileParams = IncFsNewFileParams;
 using NewMappedFileParams = IncFsNewMappedFileParams;
 using BlockCounts = IncFsBlockCounts;
 using UidReadTimeouts = IncFsUidReadTimeouts;
+using Metrics = IncFsMetrics;
+using LastReadError = IncFsLastReadError;
 
 constexpr auto kDefaultReadTimeout = std::chrono::milliseconds(INCFS_DEFAULT_READ_TIMEOUT_MS);
 constexpr int kBlockSize = INCFS_DATA_FILE_BLOCK_SIZE;
@@ -276,6 +280,9 @@ LoadingState isEverythingFullyLoaded(const Control& control);
 static const auto kTrimReservedSpace = kIncFsTrimReservedSpace;
 ErrorCode reserveSpace(const Control& control, std::string_view path, Size size);
 ErrorCode reserveSpace(const Control& control, FileId id, Size size);
+
+std::optional<Metrics> getMetrics(std::string_view sysfsName);
+std::optional<LastReadError> getLastReadError(const Control& control);
 
 // Some internal secret API as well that's not backed by C API yet.
 class MountRegistry;
