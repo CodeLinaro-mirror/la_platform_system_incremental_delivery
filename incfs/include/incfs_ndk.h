@@ -184,7 +184,6 @@ typedef struct {
     uint64_t timestampUs;
     IncFsBlockIndex block;
     uint32_t errorNo;
-    IncFsUid uid;
 } IncFsLastReadError;
 
 // All functions return -errno in case of failure.
